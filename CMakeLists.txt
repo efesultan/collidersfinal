@@ -11,6 +11,8 @@ set(sources
   sources/bellCollider.h
   sources/planeCollider.cpp
   sources/planeCollider.h
+  sources/meshCollider.cpp
+  sources/meshCollider.h
   sources/utils.hpp)
 
 add_library(colliders SHARED ${sources})
