@@ -21,6 +21,7 @@
 
 #include <maya/MFnTypedAttribute.h>
 #include <maya/MFnNumericAttribute.h>
+#include <maya/MFnMatrixAttribute.h>
 
 #include <tbb/parallel_for.h>
 
@@ -32,7 +33,9 @@ using namespace std;
 MTypeId MeshCollider::typeId(1274436);
 
 MObject MeshCollider::attr_inputMesh;
+MObject MeshCollider::attr_inputMeshMatrix;
 MObject MeshCollider::attr_colliderMesh;
+MObject MeshCollider::attr_colliderMatrix;
 MObject MeshCollider::attr_pushOffset;
 MObject MeshCollider::attr_envelope;
 MObject MeshCollider::attr_iterations;
@@ -137,8 +140,13 @@ MStatus MeshCollider::compute(const MPlug& plug, MDataBlock& dataBlock)
 	if (inputMeshObj.isNull())
 		return MS::kFailure;
 
-	MArrayDataHandle colliderArrayHandle = dataBlock.inputArrayValue(attr_colliderMesh);
-	const unsigned int numColliders = colliderArrayHandle.elementCount();
+	const MMatrix inputMeshMatrix = dataBlock.inputValue(attr_inputMeshMatrix).asMatrix();
+	const MMatrix inputMeshMatrixInverse = inputMeshMatrix.inverse();
+
+	MArrayDataHandle colliderMeshHandle = dataBlock.inputArrayValue(attr_colliderMesh);
+	MArrayDataHandle colliderMatrixHandle = dataBlock.inputArrayValue(attr_colliderMatrix);
+
+	const unsigned int numColliders = colliderMeshHandle.elementCount();
 	if (numColliders == 0)
 		return MS::kFailure;
 
@@ -152,52 +160,100 @@ MStatus MeshCollider::compute(const MPlug& plug, MDataBlock& dataBlock)
 	const bool showColliders = dataBlock.inputValue(attr_drawColliders).asBool();
 	const bool showContacts = dataBlock.inputValue(attr_drawContacts).asBool();
 
-	// ── Get garment mesh data ────────────────────────────────────────
+	// ── Get garment mesh points in world space ───────────────────────
 
 	MFnMeshData outputMeshData;
 	MObject outputMeshObj = outputMeshData.create();
 
 	MFnMesh inputMeshFn(inputMeshObj);
-	MPointArray garmentPoints;
-	inputMeshFn.getPoints(garmentPoints, MSpace::kObject);
+	MPointArray garmentPointsLocal;
+	inputMeshFn.getPoints(garmentPointsLocal, MSpace::kObject);
 
-	MFloatVectorArray garmentNormals;
-	inputMeshFn.getVertexNormals(false, garmentNormals, MSpace::kObject);
+	MFloatVectorArray garmentNormalsLocal;
+	inputMeshFn.getVertexNormals(false, garmentNormalsLocal, MSpace::kObject);
 
-	const int numVerts = garmentPoints.length();
+	const int numVerts = garmentPointsLocal.length();
 
-	MPointArray restPoints(garmentPoints);
+	// Transform garment points to world space
+	MPointArray garmentPoints(numVerts);
+	for (int i = 0; i < numVerts; i++)
+		garmentPoints[i] = garmentPointsLocal[i] * inputMeshMatrix;
+
+	// Transform normals to world space
+	vector<MVector> garmentNormals(numVerts);
+	for (int i = 0; i < numVerts; i++)
+	{
+		MVector n(garmentNormalsLocal[i].x, garmentNormalsLocal[i].y, garmentNormalsLocal[i].z);
+		garmentNormals[i] = (n * inputMeshMatrix).normal();
+	}
 
 	// Build adjacency for smoothing
 	AdjacencyMap adjacency;
 	adjacency.build(inputMeshFn);
 
-	// ── Build collider list ──────────────────────────────────────────
+	// ── Build colliders: get mesh + transform to world space ─────────
 
 	struct ColliderInfo
 	{
+		MPointArray worldPoints;
+		MIntArray polyCounts;
+		MIntArray polyConnects;
 		MFnMesh* meshFn;
 		MObject meshObj;
+		MMatrix matrix;
 	};
 
 	vector<ColliderInfo> colliders;
+
 	for (unsigned int c = 0; c < numColliders; c++)
 	{
-		colliderArrayHandle.jumpToElement(c);
-		MObject colliderObj = colliderArrayHandle.inputValue().asMesh();
-		if (!colliderObj.isNull())
+		colliderMeshHandle.jumpToElement(c);
+		MObject colliderObj = colliderMeshHandle.inputValue().asMesh();
+		if (colliderObj.isNull())
+			continue;
+
+		// Get the matching world matrix
+		MMatrix colliderMatrix;
+		if (c < colliderMatrixHandle.elementCount())
 		{
-			ColliderInfo info;
-			info.meshObj = colliderObj;
-			info.meshFn = new MFnMesh(colliderObj);
-			colliders.push_back(info);
+			colliderMatrixHandle.jumpToElement(c);
+			colliderMatrix = colliderMatrixHandle.inputValue().asMatrix();
 		}
+
+		ColliderInfo info;
+		info.meshObj = colliderObj;
+		info.matrix = colliderMatrix;
+
+		MFnMesh colMeshFn(colliderObj);
+
+		// Get local points and transform to world space
+		MPointArray localPts;
+		colMeshFn.getPoints(localPts, MSpace::kObject);
+
+		info.worldPoints.setLength(localPts.length());
+		for (unsigned int i = 0; i < localPts.length(); i++)
+			info.worldPoints[i] = localPts[i] * colliderMatrix;
+
+		colMeshFn.getVertices(info.polyCounts, info.polyConnects);
+
+		// Create a temporary world-space mesh for getClosestPoint
+		MFnMeshData tempMeshData;
+		MObject tempMeshObj = tempMeshData.create();
+
+		MFnMesh* worldMeshFn = new MFnMesh();
+		worldMeshFn->create(info.worldPoints.length(), colMeshFn.numPolygons(),
+			info.worldPoints, info.polyCounts, info.polyConnects, tempMeshObj);
+
+		info.meshFn = worldMeshFn;
+		info.meshObj = tempMeshObj;
+
+		colliders.push_back(info);
 	}
 
 	if (colliders.empty())
 		return MS::kFailure;
 
-	// ── Solve collision ──────────────────────────────────────────────
+	// ── Solve collision in world space ────────────────────────────────
 
 	vector<bool> contactFlags(numVerts, false);
 
@@ -246,9 +302,8 @@ MStatus MeshCollider::compute(const MPlug& plug, MDataBlock& dataBlock)
 						}
 						else
 						{
-							pushDir = MVector(garmentNormals[i].x, garmentNormals[i].y, garmentNormals[i].z);
+							pushDir = garmentNormals[i];
 							pushDir.normalize();
-
 							if (pushDir * faceNormal < 0)
 								pushDir = -pushDir;
 						}
@@ -293,23 +348,31 @@ MStatus MeshCollider::compute(const MPlug& plug, MDataBlock& dataBlock)
 		laplacianSmooth(garmentPoints, smoothMask, adjacency, 0.3f, 2);
 	}
 
+	// ── Transform results back to garment local space ────────────────
+
+	MPointArray outputPoints(numVerts);
+	for (int i = 0; i < numVerts; i++)
+		outputPoints[i] = garmentPoints[i] * inputMeshMatrixInverse;
+
 	// ── Create output mesh ───────────────────────────────────────────
 
 	MIntArray polyCounts, polyConnects;
 	inputMeshFn.getVertices(polyCounts, polyConnects);
 
 	MFnMesh outputMeshFn;
-	outputMeshFn.create(numVerts, inputMeshFn.numPolygons(), garmentPoints, polyCounts, polyConnects, outputMeshObj);
+	outputMeshFn.create(numVerts, inputMeshFn.numPolygons(), outputPoints, polyCounts, polyConnects, outputMeshObj);
 
 	dataBlock.outputValue(attr_outputMesh).setMObject(outputMeshObj);
 	dataBlock.setClean(attr_outputMesh);
 
-	// ── Store draw data ──────────────────────────────────────────────
+	// ── Store draw data (world space for viewport) ───────────────────
 
 	drawData.garmentPoints = garmentPoints;
-	drawData.restPoints = restPoints;
-	drawData.contactVertexIndices.clear();
+	drawData.restPoints.setLength(numVerts);
+	for (int i = 0; i < numVerts; i++)
+		drawData.restPoints[i] = garmentPointsLocal[i] * inputMeshMatrix;
 
+	drawData.contactVertexIndices.clear();
 	if (showContacts)
 	{
 		for (int i = 0; i < numVerts; i++)
@@ -333,9 +396,7 @@ MStatus MeshCollider::compute(const MPlug& plug, MDataBlock& dataBlock)
 	{
 		for (const auto& collider : colliders)
 		{
-			MPointArray pts;
-			collider.meshFn->getPoints(pts, MSpace::kObject);
-			drawData.colliderPointsList.push_back(pts);
+			drawData.colliderPointsList.push_back(collider.worldPoints);
 
 			MIntArray triCounts, triIndices;
 			collider.meshFn->getTriangles(triCounts, triIndices);
@@ -356,15 +417,25 @@ MStatus MeshCollider::initialize()
 {
 	MFnTypedAttribute tAttr;
 	MFnNumericAttribute nAttr;
+	MFnMatrixAttribute mAttr;
 
 	attr_inputMesh = tAttr.create("inputMesh", "inMesh", MFnData::kMesh);
 	tAttr.setHidden(true);
 	addAttribute(attr_inputMesh);
 
+	attr_inputMeshMatrix = mAttr.create("inputMeshMatrix", "inMeshMat");
+	mAttr.setHidden(true);
+	addAttribute(attr_inputMeshMatrix);
+
 	attr_colliderMesh = tAttr.create("colliderMesh", "colMesh", MFnData::kMesh);
 	tAttr.setArray(true);
 	tAttr.setHidden(true);
 	addAttribute(attr_colliderMesh);
+
+	attr_colliderMatrix = mAttr.create("colliderMatrix", "colMat");
+	mAttr.setArray(true);
+	mAttr.setHidden(true);
+	addAttribute(attr_colliderMatrix);
 
 	attr_pushOffset = nAttr.create("pushOffset", "pushOff", MFnNumericData::kFloat, 0.05);
 	nAttr.setMin(0.0);
@@ -413,8 +484,12 @@ MStatus MeshCollider::initialize()
 	tAttr.setHidden(true);
 	addAttribute(attr_outputMesh);
 
+	// ── Attribute affects ────────────────────────────────────────────
+
 	attributeAffects(attr_inputMesh, attr_outputMesh);
+	attributeAffects(attr_inputMeshMatrix, attr_outputMesh);
 	attributeAffects(attr_colliderMesh, attr_outputMesh);
+	attributeAffects(attr_colliderMatrix, attr_outputMesh);
 	attributeAffects(attr_pushOffset, attr_outputMesh);
 	attributeAffects(attr_envelope, attr_outputMesh);
 	attributeAffects(attr_iterations, attr_outputMesh);
