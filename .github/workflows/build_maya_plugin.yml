@@ -1,0 +1,199 @@
+# .github/workflows/build_maya_plugin.yml
+#
+# Compiles the Bell Collider Maya plugin (.mll) for Windows
+# using GitHub Actions (free for public repos).
+#
+# SETUP (one-time):
+#   1. Fork azagoruyko/colliders to your own GitHub account
+#   2. Download the Maya 2026 devkit from Autodesk Developer Center:
+#      https://aps.autodesk.com/developer/overview/maya
+#   3. Zip the devkitBase folder and upload it as a GitHub Release asset
+#      named "maya2026_devkit.zip" in your repo (tag it e.g. "devkit-v1")
+#      OR place it in a folder called "devkit" in the repo root.
+#   4. Push this file to .github/workflows/build_maya_plugin.yml
+#   5. The workflow builds on every push, or you can trigger it manually.
+#   6. Download the compiled .mll from the Actions tab → Artifacts.
+#
+# Maya version can be changed via workflow_dispatch input.
+
+name: Build Maya Plugin
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      maya_version:
+        description: 'Maya version to build for'
+        required: false
+        default: '2026'
+        type: choice
+        options:
+          - '2024'
+          - '2025'
+          - '2026'
+
+env:
+  MAYA_VERSION: ${{ github.event.inputs.maya_version || '2026' }}
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    
+    steps:
+      # ── 1. Checkout the repo ──────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Setup MSVC (VS 2022) ──────────────────────────────────────
+      - name: Setup MSVC
+        uses: microsoft/setup-msbuild@v2
+
+      # ── 3. Install CMake ─────────────────────────────────────────────
+      - name: Setup CMake
+        uses: lukka/get-cmake@latest
+
+      # ── 4. Get Maya Devkit ───────────────────────────────────────────
+      # Option A: Devkit is in the repo under devkit/ folder
+      # Option B: Download from a GitHub Release asset
+      # 
+      # This step tries Option A first, then falls back to Option B.
+      # Adjust the RELEASE_TAG and ASSET_NAME to match your setup.
+      - name: Prepare Maya Devkit
+        shell: pwsh
+        run: |
+          $devkitPath = "${{ github.workspace }}\devkit"
+          
+          # Option A: Check if devkit folder exists in repo
+          if (Test-Path "$devkitPath\include\maya\MFnPlugin.h") {
+            Write-Host "✅ Found devkit in repo at $devkitPath"
+            echo "DEVKIT_LOCATION=$devkitPath" >> $env:GITHUB_ENV
+            exit 0
+          }
+          
+          # Option A2: Check for devkitBase subfolder
+          if (Test-Path "$devkitPath\devkitBase\include\maya\MFnPlugin.h") {
+            Write-Host "✅ Found devkit in repo at $devkitPath\devkitBase"
+            echo "DEVKIT_LOCATION=$devkitPath\devkitBase" >> $env:GITHUB_ENV
+            exit 0
+          }
+          
+          # Option B: Download from GitHub Release
+          Write-Host "⬇ Devkit not found in repo, attempting to download from Releases..."
+          $repo = "${{ github.repository }}"
+          $assetName = "maya${{ env.MAYA_VERSION }}_devkit.zip"
+          
+          try {
+            # Get the latest release that has the devkit asset
+            $headers = @{}
+            if ("${{ secrets.GITHUB_TOKEN }}") {
+              $headers["Authorization"] = "token ${{ secrets.GITHUB_TOKEN }}"
+            }
+            
+            $releases = Invoke-RestMethod `
+              -Uri "https://api.github.com/repos/$repo/releases" `
+              -Headers $headers
+            
+            $downloadUrl = $null
+            foreach ($release in $releases) {
+              foreach ($asset in $release.assets) {
+                if ($asset.name -eq $assetName) {
+                  $downloadUrl = $asset.browser_download_url
+                  Write-Host "Found devkit asset in release: $($release.tag_name)"
+                  break
+                }
+              }
+              if ($downloadUrl) { break }
+            }
+            
+            if (-not $downloadUrl) {
+              Write-Host "❌ ERROR: Could not find '$assetName' in any GitHub Release."
+              Write-Host ""
+              Write-Host "Please do ONE of the following:"
+              Write-Host "  1. Place the Maya devkit in a 'devkit/' folder in your repo"
+              Write-Host "  2. Upload '$assetName' as a GitHub Release asset"
+              Write-Host ""
+              Write-Host "Download the devkit from: https://aps.autodesk.com/developer/overview/maya"
+              exit 1
+            }
+            
+            # Download and extract
+            $zipPath = "${{ runner.temp }}\devkit.zip"
+            Invoke-WebRequest -Uri $downloadUrl -OutFile $zipPath -Headers $headers
+            Expand-Archive -Path $zipPath -DestinationPath "${{ runner.temp }}\devkit"
+            
+            # Find the actual devkit root (may be nested)
+            $found = Get-ChildItem -Path "${{ runner.temp }}\devkit" -Recurse -Filter "MFnPlugin.h" | Select-Object -First 1
+            if ($found) {
+              # Go up from include/maya/MFnPlugin.h to the devkit root
+              $devkitRoot = $found.Directory.Parent.Parent.FullName
+              Write-Host "✅ Devkit extracted to: $devkitRoot"
+              echo "DEVKIT_LOCATION=$devkitRoot" >> $env:GITHUB_ENV
+            } else {
+              Write-Host "❌ ERROR: Downloaded zip does not contain Maya devkit headers."
+              exit 1
+            }
+          }
+          catch {
+            Write-Host "❌ ERROR: Failed to download devkit: $_"
+            Write-Host "Please place the Maya devkit in a 'devkit/' folder in your repo."
+            exit 1
+          }
+
+      # ── 5. Configure with CMake ──────────────────────────────────────
+      - name: CMake Configure
+        shell: pwsh
+        run: |
+          mkdir build -Force
+          cd build
+          cmake .. `
+            -G "Visual Studio 17 2022" `
+            -A x64 `
+            -DMAYA_VERSION="${{ env.MAYA_VERSION }}" `
+            -DDEVKIT_LOCATION="$env:DEVKIT_LOCATION" `
+            -DCMAKE_BUILD_TYPE=Release
+
+      # ── 6. Build ─────────────────────────────────────────────────────
+      - name: Build Plugin
+        shell: pwsh
+        run: |
+          cd build
+          cmake --build . --config Release --parallel
+
+      # ── 7. Find and collect the .mll file(s) ────────────────────────
+      - name: Collect Artifacts
+        shell: pwsh
+        run: |
+          $artifactDir = "${{ github.workspace }}\artifacts"
+          mkdir $artifactDir -Force
+          
+          # Find all .mll files in the build directory
+          $mllFiles = Get-ChildItem -Path "${{ github.workspace }}\build" -Recurse -Filter "*.mll"
+          
+          if ($mllFiles.Count -eq 0) {
+            Write-Host "⚠ No .mll files found. Looking for .dll files instead..."
+            $mllFiles = Get-ChildItem -Path "${{ github.workspace }}\build" -Recurse -Filter "*.dll"
+          }
+          
+          foreach ($file in $mllFiles) {
+            Write-Host "📦 Found: $($file.FullName)"
+            Copy-Item $file.FullName -Destination $artifactDir
+          }
+          
+          if ($mllFiles.Count -eq 0) {
+            Write-Host "❌ No plugin files found in build output!"
+            Get-ChildItem -Path "${{ github.workspace }}\build" -Recurse | Select-Object FullName
+            exit 1
+          }
+          
+          Write-Host "✅ Collected $($mllFiles.Count) plugin file(s)"
+
+      # ── 8. Upload as GitHub Actions artifact ─────────────────────────
+      - name: Upload Plugin Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bellCollider-maya${{ env.MAYA_VERSION }}-win64
+          path: artifacts/
+          retention-days: 90
