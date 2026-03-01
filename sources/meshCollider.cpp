@@ -16,6 +16,7 @@
 #include <maya/MFnMesh.h>
 #include <maya/MFnMeshData.h>
 #include <maya/MMeshIntersector.h>
+#include <maya/MItMeshVertex.h>
 
 #include <maya/MArrayDataBuilder.h>
 #include <maya/MArrayDataHandle.h>
@@ -31,7 +32,6 @@
 
 using namespace std;
 
-// Use a unique typeId — must not clash with bellCollider (1274434) or planeCollider
 MTypeId MeshCollider::typeId(1274436);
 
 MObject MeshCollider::attr_inputMesh;
@@ -48,6 +48,89 @@ MObject MeshCollider::attr_outputMesh;
 
 MString MeshCollider::drawDbClassification = "drawdb/geometry/meshCollider";
 MString MeshCollider::drawRegistrantId = "collidersPlugin_meshCollider";
+
+// ── Helper: build vertex adjacency map for smoothing ─────────────────
+
+struct AdjacencyMap
+{
+	vector<vector<int>> neighbors; // neighbors[vertexIndex] = list of adjacent vertex indices
+
+	void build(MFnMesh& meshFn)
+	{
+		int numVerts = meshFn.numVertices();
+		neighbors.resize(numVerts);
+
+		MIntArray polyCounts, polyConnects;
+		meshFn.getVertices(polyCounts, polyConnects);
+
+		int connectIdx = 0;
+		for (unsigned int faceIdx = 0; faceIdx < polyCounts.length(); faceIdx++)
+		{
+			int numFaceVerts = polyCounts[faceIdx];
+			vector<int> faceVerts(numFaceVerts);
+
+			for (int v = 0; v < numFaceVerts; v++)
+				faceVerts[v] = polyConnects[connectIdx + v];
+
+			// Each vertex in the face is neighbor to the next and previous
+			for (int v = 0; v < numFaceVerts; v++)
+			{
+				int curr = faceVerts[v];
+				int next = faceVerts[(v + 1) % numFaceVerts];
+				int prev = faceVerts[(v + numFaceVerts - 1) % numFaceVerts];
+
+				// Add unique neighbors
+				auto& n = neighbors[curr];
+				if (find(n.begin(), n.end(), next) == n.end())
+					n.push_back(next);
+				if (find(n.begin(), n.end(), prev) == n.end())
+					n.push_back(prev);
+			}
+
+			connectIdx += numFaceVerts;
+		}
+	}
+};
+
+// ── Helper: Laplacian smooth on specific vertices ────────────────────
+
+void laplacianSmooth(MPointArray& points, const vector<bool>& affected,
+	const AdjacencyMap& adj, float strength, int smoothIterations)
+{
+	const int numVerts = points.length();
+
+	for (int iter = 0; iter < smoothIterations; iter++)
+	{
+		MPointArray smoothed(points);
+
+		for (int i = 0; i < numVerts; i++)
+		{
+			if (!affected[i])
+				continue;
+
+			const auto& nbrs = adj.neighbors[i];
+			if (nbrs.empty())
+				continue;
+
+			MPoint avg(0, 0, 0);
+			for (int n : nbrs)
+				avg += MVector(points[n]);
+
+			avg = avg * (1.0 / nbrs.size());
+
+			smoothed[i] = points[i] + (MVector(avg) - MVector(points[i])) * strength;
+		}
+
+		// Copy back only affected vertices
+		for (int i = 0; i < numVerts; i++)
+		{
+			if (affected[i])
+				points[i] = smoothed[i];
+		}
+	}
+}
+
+// ── Compute ──────────────────────────────────────────────────────────
 
 MStatus MeshCollider::compute(const MPlug& plug, MDataBlock& dataBlock)
 {
@@ -75,7 +158,7 @@ MStatus MeshCollider::compute(const MPlug& plug, MDataBlock& dataBlock)
 	const bool showColliders = dataBlock.inputValue(attr_drawColliders).asBool();
 	const bool showContacts = dataBlock.inputValue(attr_drawContacts).asBool();
 
-	// ── Copy garment mesh for output ─────────────────────────────────
+	// ── Get garment mesh data ────────────────────────────────────────
 
 	MFnMeshData outputMeshData;
 	MObject outputMeshObj = outputMeshData.create();
@@ -89,15 +172,19 @@ MStatus MeshCollider::compute(const MPlug& plug, MDataBlock& dataBlock)
 
 	const int numVerts = garmentPoints.length();
 
-	// Store rest positions for drawing
 	MPointArray restPoints(garmentPoints);
 
-	// ── Build collider MFnMesh list ──────────────────────────────────
+	// Build adjacency for smoothing
+	AdjacencyMap adjacency;
+	adjacency.build(inputMeshFn);
+
+	// ── Build collider list with accelerated intersection ────────────
 
 	struct ColliderInfo
 	{
 		MFnMesh* meshFn;
 		MObject meshObj;
+		MMeshIntersector* intersector;
 	};
 
 	vector<ColliderInfo> colliders;
@@ -110,27 +197,26 @@ MStatus MeshCollider::compute(const MPlug& plug, MDataBlock& dataBlock)
 			ColliderInfo info;
 			info.meshObj = colliderObj;
 			info.meshFn = new MFnMesh(colliderObj);
+
+			// Create accelerated intersector for fast closest-point queries
+			info.intersector = new MMeshIntersector();
+			info.intersector->create(colliderObj, MMatrix::identity);
+
 			colliders.push_back(info);
 		}
 	}
 
 	if (colliders.empty())
-	{
-		// Cleanup
 		return MS::kFailure;
-	}
 
 	// ── Solve collision ──────────────────────────────────────────────
-	// For each iteration, for each garment vertex, test against all
-	// collider meshes. If the vertex is inside a collider, push it
-	// out along the collider surface normal + offset.
 
-	vector<int> contactVerts;
+	vector<bool> contactFlags(numVerts, false);
 
 	for (int iter = 0; iter < iterations; iter++)
 	{
-		// We need thread-safe contact tracking only on last iteration
-		vector<bool> contactFlags(numVerts, false);
+		if (iter > 0)
+			fill(contactFlags.begin(), contactFlags.end(), false);
 
 		tbb::parallel_for(tbb::blocked_range<int>(0, numVerts), [&](tbb::blocked_range<int>& r)
 		{
@@ -143,20 +229,16 @@ MStatus MeshCollider::compute(const MPlug& plug, MDataBlock& dataBlock)
 
 				for (const auto& collider : colliders)
 				{
-					// Find closest point on collider surface
-					MPoint closestPoint;
-					MVector closestNormal;
-
-					MPoint closestPt;
-					int faceId;
-
-					// getClosestPoint returns the closest point on the mesh
-					if (collider.meshFn->getClosestPoint(srcPoint, closestPt, MSpace::kWorld, &faceId) != MS::kSuccess)
+					// Use accelerated closest point query
+					MPointOnMesh pointOnMesh;
+					if (collider.intersector->getClosestPoint(srcPoint, pointOnMesh) != MS::kSuccess)
 						continue;
 
-					// Get the face normal at the closest point
-					MVector faceNormal;
-					collider.meshFn->getPolygonNormal(faceId, faceNormal, MSpace::kWorld);
+					MPoint closestPt = pointOnMesh.getPoint();
+					MVector faceNormal = pointOnMesh.getNormal();
+
+					// Ensure normal is normalized
+					faceNormal.normalize();
 
 					// Vector from closest surface point to garment vertex
 					MVector toVertex(
@@ -165,30 +247,37 @@ MStatus MeshCollider::compute(const MPlug& plug, MDataBlock& dataBlock)
 						srcPoint.z - closestPt.z
 					);
 
-					// Dot product: negative means vertex is inside the collider
-					double dot = toVertex.x * faceNormal.x
-					           + toVertex.y * faceNormal.y
-					           + toVertex.z * faceNormal.z;
+					double distToSurface = toVertex.length();
+					if (distToSurface < 1e-8)
+						distToSurface = 1e-8;
 
+					// Dot product determines which side of the surface we're on
+					double dot = toVertex * faceNormal;
+
+					// If dot is negative, vertex is inside the collider mesh
+					// If dot is positive but less than pushOffset, vertex is too close
 					if (dot < pushOffset)
 					{
-						// Vertex is inside or too close — push it out
 						double pushDist = pushOffset - dot;
 
-						MVector pushVec;
+						MVector pushDir;
 						if (useProxyNormal)
 						{
-							// Push along the collider's surface normal
-							pushVec = faceNormal * pushDist;
+							pushDir = faceNormal;
 						}
 						else
 						{
-							// Push along the garment vertex's own normal
-							MVector vn(garmentNormals[i].x, garmentNormals[i].y, garmentNormals[i].z);
-							pushVec = vn * pushDist;
+							pushDir = MVector(garmentNormals[i].x, garmentNormals[i].y, garmentNormals[i].z);
+							pushDir.normalize();
+
+							// Ensure we push outward (same hemisphere as face normal)
+							if (pushDir * faceNormal < 0)
+								pushDir = -pushDir;
 						}
 
+						MVector pushVec = pushDir * pushDist;
 						double pushLen = pushVec.length();
+
 						if (pushLen > bestPushLen)
 						{
 							bestPush = pushVec;
@@ -210,20 +299,25 @@ MStatus MeshCollider::compute(const MPlug& plug, MDataBlock& dataBlock)
 			}
 		});
 
-		// Collect contact vertices (last iteration only, for drawing)
-		if (iter == iterations - 1 && showContacts)
+		// ── Smooth the collision area to prevent vertex jumbling ──────
+
+		// Expand the affected area slightly — include neighbors of contact verts
+		vector<bool> smoothMask(numVerts, false);
+		for (int i = 0; i < numVerts; i++)
 		{
-			for (int i = 0; i < numVerts; i++)
+			if (contactFlags[i])
 			{
-				if (contactFlags[i])
-					contactVerts.push_back(i);
+				smoothMask[i] = true;
+				for (int n : adjacency.neighbors[i])
+					smoothMask[n] = true;
 			}
 		}
+
+		laplacianSmooth(garmentPoints, smoothMask, adjacency, 0.3f, 2);
 	}
 
 	// ── Create output mesh ───────────────────────────────────────────
 
-	// Copy input mesh topology to output
 	MIntArray polyCounts, polyConnects;
 	inputMeshFn.getVertices(polyCounts, polyConnects);
 
@@ -238,15 +332,22 @@ MStatus MeshCollider::compute(const MPlug& plug, MDataBlock& dataBlock)
 	drawData.garmentPoints = garmentPoints;
 	drawData.restPoints = restPoints;
 	drawData.contactVertexIndices.clear();
-	drawData.contactVertexIndices = contactVerts;
+
+	if (showContacts)
+	{
+		for (int i = 0; i < numVerts; i++)
+		{
+			if (contactFlags[i])
+				drawData.contactVertexIndices.push_back(i);
+		}
+	}
+
 	drawData.garmentColor = MColor(colorVec.x, colorVec.y, colorVec.z, drawOpacity);
 	drawData.colliderColor = MColor(colorVec.x * 0.5, colorVec.y * 0.5, colorVec.z * 0.5, drawOpacity * 0.5);
 	drawData.contactColor = MColor(1.0f, 0.2f, 0.1f, 1.0f);
 
-	// Get garment triangles for drawing
 	inputMeshFn.getTriangles(drawData.triangleCounts, drawData.triangleIndices);
 
-	// Get collider drawing data
 	drawData.colliderPointsList.clear();
 	drawData.colliderTriCountsList.clear();
 	drawData.colliderTriIndicesList.clear();
@@ -269,7 +370,10 @@ MStatus MeshCollider::compute(const MPlug& plug, MDataBlock& dataBlock)
 	// ── Cleanup ──────────────────────────────────────────────────────
 
 	for (auto& collider : colliders)
+	{
+		delete collider.intersector;
 		delete collider.meshFn;
+	}
 
 	return MS::kSuccess;
 }
@@ -279,20 +383,14 @@ MStatus MeshCollider::initialize()
 	MFnTypedAttribute tAttr;
 	MFnNumericAttribute nAttr;
 
-	// ── Input: garment mesh ──────────────────────────────────────────
-
 	attr_inputMesh = tAttr.create("inputMesh", "inMesh", MFnData::kMesh);
 	tAttr.setHidden(true);
 	addAttribute(attr_inputMesh);
-
-	// ── Input: collider meshes (array) ───────────────────────────────
 
 	attr_colliderMesh = tAttr.create("colliderMesh", "colMesh", MFnData::kMesh);
 	tAttr.setArray(true);
 	tAttr.setHidden(true);
 	addAttribute(attr_colliderMesh);
-
-	// ── Input: solver settings ───────────────────────────────────────
 
 	attr_pushOffset = nAttr.create("pushOffset", "pushOff", MFnNumericData::kFloat, 0.05);
 	nAttr.setMin(0.0);
@@ -316,8 +414,6 @@ MStatus MeshCollider::initialize()
 	nAttr.setKeyable(true);
 	addAttribute(attr_useProxyNormal);
 
-	// ── Input: draw settings ─────────────────────────────────────────
-
 	attr_drawColor = nAttr.create("drawColor", "drawColor", MFnNumericData::k3Double);
 	nAttr.setDefault(0.0, 0.3, 0.6);
 	nAttr.setMin(0, 0, 0);
@@ -339,13 +435,9 @@ MStatus MeshCollider::initialize()
 	nAttr.setKeyable(true);
 	addAttribute(attr_drawContacts);
 
-	// ── Output: deformed garment mesh ────────────────────────────────
-
 	attr_outputMesh = tAttr.create("outputMesh", "outMesh", MFnData::kMesh);
 	tAttr.setHidden(true);
 	addAttribute(attr_outputMesh);
-
-	// ── Attribute affects ────────────────────────────────────────────
 
 	attributeAffects(attr_inputMesh, attr_outputMesh);
 	attributeAffects(attr_colliderMesh, attr_outputMesh);
@@ -365,7 +457,6 @@ MStatus MeshCollider::initialize()
 
 void MeshCollider::drawUI(MHWRender::MUIDrawManager& drawManager)
 {
-	// Draw collider meshes as semi-transparent overlays
 	for (size_t c = 0; c < drawData.colliderPointsList.size(); c++)
 	{
 		const MPointArray& pts = drawData.colliderPointsList[c];
@@ -379,7 +470,6 @@ void MeshCollider::drawUI(MHWRender::MUIDrawManager& drawManager)
 
 		drawManager.mesh(MHWRender::MUIDrawManager::kTriangles, positions, NULL, &colors);
 
-		// Wireframe
 		drawManager.setColor(MColor(0, 0, 0, 0.3f));
 		for (unsigned int i = 0; i < triIndices.length(); i += 3)
 		{
@@ -392,7 +482,6 @@ void MeshCollider::drawUI(MHWRender::MUIDrawManager& drawManager)
 		}
 	}
 
-	// Draw contact points
 	if (!drawData.contactVertexIndices.empty())
 	{
 		drawManager.setColor(drawData.contactColor);
