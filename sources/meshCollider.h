@@ -35,7 +35,9 @@ public:
 
 	// Input attributes
 	static MObject attr_inputMesh;
+	static MObject attr_inputMeshMatrix;
 	static MObject attr_colliderMesh;
+	static MObject attr_colliderMatrix;
 	static MObject attr_pushOffset;
 	static MObject attr_envelope;
 	static MObject attr_iterations;
@@ -77,5 +79,5 @@ public:
 	virtual void addUIDrawables(const MDagPath& objPath, MHWRender::MUIDrawManager& drawManager, const MHWRender::MFrameContext& frameContext, const MUserData* data);
 
 private:
-	MeshColliderDrawOverride(const MObject& obj) : MHWRender::MPxDrawOverride(obj, NULL, true) {} // alwaysDirty = true
+	MeshColliderDrawOverride(const MObject& obj) : MHWRender::MPxDrawOverride(obj, NULL, true) {}
 };
