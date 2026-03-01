@@ -148,11 +148,13 @@ jobs:
         run: |
           mkdir build -Force
           cd build
-          cmake .. `
+         cmake .. `
             -G "Visual Studio 17 2022" `
             -A x64 `
             -DMAYA_VERSION="${{ env.MAYA_VERSION }}" `
             -DDEVKIT_LOCATION="$env:DEVKIT_LOCATION" `
+            -DMAYA_DEVKIT_DIR="$env:DEVKIT_LOCATION" `
+            -DMAYA_DEVKIT_BASE="$env:DEVKIT_LOCATION" `
             -DCMAKE_BUILD_TYPE=Release
 
       # ── 6. Build ─────────────────────────────────────────────────────
