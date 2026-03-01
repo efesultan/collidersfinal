@@ -15,15 +15,12 @@
 
 #include <maya/MFnMesh.h>
 #include <maya/MFnMeshData.h>
-#include <maya/MMeshIntersector.h>
-#include <maya/MItMeshVertex.h>
 
 #include <maya/MArrayDataBuilder.h>
 #include <maya/MArrayDataHandle.h>
 
 #include <maya/MFnTypedAttribute.h>
 #include <maya/MFnNumericAttribute.h>
-#include <maya/MFnGenericAttribute.h>
 
 #include <tbb/parallel_for.h>
 
@@ -53,7 +50,7 @@ MString MeshCollider::drawRegistrantId = "collidersPlugin_meshCollider";
 
 struct AdjacencyMap
 {
-	vector<vector<int>> neighbors; // neighbors[vertexIndex] = list of adjacent vertex indices
+	vector<vector<int>> neighbors;
 
 	void build(MFnMesh& meshFn)
 	{
@@ -72,14 +69,12 @@ struct AdjacencyMap
 			for (int v = 0; v < numFaceVerts; v++)
 				faceVerts[v] = polyConnects[connectIdx + v];
 
-			// Each vertex in the face is neighbor to the next and previous
 			for (int v = 0; v < numFaceVerts; v++)
 			{
 				int curr = faceVerts[v];
 				int next = faceVerts[(v + 1) % numFaceVerts];
 				int prev = faceVerts[(v + numFaceVerts - 1) % numFaceVerts];
 
-				// Add unique neighbors
 				auto& n = neighbors[curr];
 				if (find(n.begin(), n.end(), next) == n.end())
 					n.push_back(next);
@@ -121,7 +116,6 @@ void laplacianSmooth(MPointArray& points, const vector<bool>& affected,
 			smoothed[i] = points[i] + (MVector(avg) - MVector(points[i])) * strength;
 		}
 
-		// Copy back only affected vertices
 		for (int i = 0; i < numVerts; i++)
 		{
 			if (affected[i])
@@ -165,10 +159,10 @@ MStatus MeshCollider::compute(const MPlug& plug, MDataBlock& dataBlock)
 
 	MFnMesh inputMeshFn(inputMeshObj);
 	MPointArray garmentPoints;
-	inputMeshFn.getPoints(garmentPoints, MSpace::kWorld);
+	inputMeshFn.getPoints(garmentPoints, MSpace::kObject);
 
 	MFloatVectorArray garmentNormals;
-	inputMeshFn.getVertexNormals(false, garmentNormals, MSpace::kWorld);
+	inputMeshFn.getVertexNormals(false, garmentNormals, MSpace::kObject);
 
 	const int numVerts = garmentPoints.length();
 
@@ -178,13 +172,12 @@ MStatus MeshCollider::compute(const MPlug& plug, MDataBlock& dataBlock)
 	AdjacencyMap adjacency;
 	adjacency.build(inputMeshFn);
 
-	// ── Build collider list with accelerated intersection ────────────
+	// ── Build collider list ──────────────────────────────────────────
 
 	struct ColliderInfo
 	{
 		MFnMesh* meshFn;
 		MObject meshObj;
-		MMeshIntersector* intersector;
 	};
 
 	vector<ColliderInfo> colliders;
@@ -197,11 +190,6 @@ MStatus MeshCollider::compute(const MPlug& plug, MDataBlock& dataBlock)
 			ColliderInfo info;
 			info.meshObj = colliderObj;
 			info.meshFn = new MFnMesh(colliderObj);
-
-			// Create accelerated intersector for fast closest-point queries
-			info.intersector = new MMeshIntersector();
-			info.intersector->create(colliderObj, MMatrix::identity);
-
 			colliders.push_back(info);
 		}
 	}
@@ -229,33 +217,24 @@ MStatus MeshCollider::compute(const MPlug& plug, MDataBlock& dataBlock)
 
 				for (const auto& collider : colliders)
 				{
-					// Use accelerated closest point query
-					MPointOnMesh pointOnMesh;
-					if (collider.intersector->getClosestPoint(srcPoint, pointOnMesh) != MS::kSuccess)
+					MPoint closestPt;
+					int faceId;
+
+					if (collider.meshFn->getClosestPoint(srcPoint, closestPt, MSpace::kObject, &faceId) != MS::kSuccess)
 						continue;
 
-					MPoint closestPt = pointOnMesh.getPoint();
-					MVector faceNormal = pointOnMesh.getNormal();
-
-					// Ensure normal is normalized
+					MVector faceNormal;
+					collider.meshFn->getPolygonNormal(faceId, faceNormal, MSpace::kObject);
 					faceNormal.normalize();
 
-					// Vector from closest surface point to garment vertex
 					MVector toVertex(
 						srcPoint.x - closestPt.x,
 						srcPoint.y - closestPt.y,
 						srcPoint.z - closestPt.z
 					);
 
-					double distToSurface = toVertex.length();
-					if (distToSurface < 1e-8)
-						distToSurface = 1e-8;
-
-					// Dot product determines which side of the surface we're on
 					double dot = toVertex * faceNormal;
 
-					// If dot is negative, vertex is inside the collider mesh
-					// If dot is positive but less than pushOffset, vertex is too close
 					if (dot < pushOffset)
 					{
 						double pushDist = pushOffset - dot;
@@ -270,7 +249,6 @@ MStatus MeshCollider::compute(const MPlug& plug, MDataBlock& dataBlock)
 							pushDir = MVector(garmentNormals[i].x, garmentNormals[i].y, garmentNormals[i].z);
 							pushDir.normalize();
 
-							// Ensure we push outward (same hemisphere as face normal)
 							if (pushDir * faceNormal < 0)
 								pushDir = -pushDir;
 						}
@@ -299,9 +277,8 @@ MStatus MeshCollider::compute(const MPlug& plug, MDataBlock& dataBlock)
 			}
 		});
 
-		// ── Smooth the collision area to prevent vertex jumbling ──────
+		// ── Smooth collision area ────────────────────────────────────
 
-		// Expand the affected area slightly — include neighbors of contact verts
 		vector<bool> smoothMask(numVerts, false);
 		for (int i = 0; i < numVerts; i++)
 		{
@@ -357,7 +334,7 @@ MStatus MeshCollider::compute(const MPlug& plug, MDataBlock& dataBlock)
 		for (const auto& collider : colliders)
 		{
 			MPointArray pts;
-			collider.meshFn->getPoints(pts, MSpace::kWorld);
+			collider.meshFn->getPoints(pts, MSpace::kObject);
 			drawData.colliderPointsList.push_back(pts);
 
 			MIntArray triCounts, triIndices;
@@ -370,10 +347,7 @@ MStatus MeshCollider::compute(const MPlug& plug, MDataBlock& dataBlock)
 	// ── Cleanup ──────────────────────────────────────────────────────
 
 	for (auto& collider : colliders)
-	{
-		delete collider.intersector;
 		delete collider.meshFn;
-	}
 
 	return MS::kSuccess;
 }
