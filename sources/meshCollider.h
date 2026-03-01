@@ -1,56 +1,81 @@
-#include <maya/MFnPlugin.h>
-#include "bellCollider.h"
-#include "planeCollider.h"
-#include "meshCollider.h"
+#pragma once
 
-MStatus initializePlugin(MObject plugin)
+#include <maya/MPxLocatorNode.h>
+#include <maya/MPxDrawOverride.h>
+#include <maya/MDrawRegistry.h>
+#include <maya/MPointArray.h>
+#include <maya/MFloatPointArray.h>
+#include <maya/MColorArray.h>
+#include <vector>
+#include <string>
+
+using namespace std;
+
+struct MeshColliderDrawData_t
 {
-	MStatus stat;
-	MFnPlugin pluginFn(plugin);
+	MPointArray garmentPoints;
+	MPointArray restPoints;
+	MIntArray triangleCounts;
+	MIntArray triangleIndices;
+	vector<MPointArray> colliderPointsList;
+	vector<MIntArray> colliderTriCountsList;
+	vector<MIntArray> colliderTriIndicesList;
+	vector<int> contactVertexIndices;
+	MColor garmentColor;
+	MColor colliderColor;
+	MColor contactColor;
+};
 
-	stat = pluginFn.registerNode("bellCollider", BellCollider::typeId, BellCollider::creator, BellCollider::initialize, MPxNode::kLocatorNode, &BellCollider::drawDbClassification);
-	CHECK_MSTATUS_AND_RETURN_IT(stat);
-
-	stat = MHWRender::MDrawRegistry::registerDrawOverrideCreator(BellCollider::drawDbClassification, BellCollider::drawRegistrantId, BellColliderDrawOverride::creator);
-	CHECK_MSTATUS_AND_RETURN_IT(stat);
-
-	stat = pluginFn.registerNode("planeCollider", PlaneCollider::typeId, PlaneCollider::creator, PlaneCollider::initialize, MPxNode::kLocatorNode, &PlaneCollider::drawDbClassification);
-	CHECK_MSTATUS_AND_RETURN_IT(stat);
-
-	stat = MHWRender::MDrawRegistry::registerDrawOverrideCreator(PlaneCollider::drawDbClassification, PlaneCollider::drawRegistrantId, PlaneColliderDrawOverride::creator);
-	CHECK_MSTATUS_AND_RETURN_IT(stat);
-
-	stat = pluginFn.registerNode("meshCollider", MeshCollider::typeId, MeshCollider::creator, MeshCollider::initialize, MPxNode::kLocatorNode, &MeshCollider::drawDbClassification);
-	CHECK_MSTATUS_AND_RETURN_IT(stat);
-
-	stat = MHWRender::MDrawRegistry::registerDrawOverrideCreator(MeshCollider::drawDbClassification, MeshCollider::drawRegistrantId, MeshColliderDrawOverride::creator);
-	CHECK_MSTATUS_AND_RETURN_IT(stat);
-
-	return MS::kSuccess;
-}
-
-MStatus uninitializePlugin(MObject plugin)
+class MeshCollider : public MPxLocatorNode
 {
-	MStatus stat;
-	MFnPlugin pluginFn(plugin);
+public:
+	static MTypeId typeId;
+	static MString drawDbClassification;
+	static MString drawRegistrantId;
 
-	stat = MHWRender::MDrawRegistry::deregisterDrawOverrideCreator(BellCollider::drawDbClassification, BellCollider::drawRegistrantId);
-	CHECK_MSTATUS_AND_RETURN_IT(stat);
+	// Input attributes
+	static MObject attr_inputMesh;
+	static MObject attr_colliderMesh;
+	static MObject attr_pushOffset;
+	static MObject attr_envelope;
+	static MObject attr_iterations;
+	static MObject attr_useProxyNormal;
 
-	stat = pluginFn.deregisterNode(BellCollider::typeId);
-	CHECK_MSTATUS_AND_RETURN_IT(stat);
+	// Draw attributes
+	static MObject attr_drawColor;
+	static MObject attr_drawOpacity;
+	static MObject attr_drawColliders;
+	static MObject attr_drawContacts;
 
-	stat = MHWRender::MDrawRegistry::deregisterDrawOverrideCreator(PlaneCollider::drawDbClassification, PlaneCollider::drawRegistrantId);
-	CHECK_MSTATUS_AND_RETURN_IT(stat);
+	// Output attributes
+	static MObject attr_outputMesh;
 
-	stat = pluginFn.deregisterNode(PlaneCollider::typeId);
-	CHECK_MSTATUS_AND_RETURN_IT(stat);
+	MeshColliderDrawData_t drawData;
 
-	stat = MHWRender::MDrawRegistry::deregisterDrawOverrideCreator(MeshCollider::drawDbClassification, MeshCollider::drawRegistrantId);
-	CHECK_MSTATUS_AND_RETURN_IT(stat);
+	static void* creator() { return new MeshCollider(); }
+	static MStatus initialize();
+	MStatus compute(const MPlug&, MDataBlock&);
+	void drawUI(MHWRender::MUIDrawManager&);
 
-	stat = pluginFn.deregisterNode(MeshCollider::typeId);
-	CHECK_MSTATUS_AND_RETURN_IT(stat);
+private:
+};
 
-	return MS::kSuccess;
-}
+class MeshColliderUserData : public MUserData
+{
+public:
+	MeshColliderUserData() : MUserData(false) {}
+	MeshCollider* meshCollider{ nullptr };
+};
+
+class MeshColliderDrawOverride : public MHWRender::MPxDrawOverride
+{
+public:
+	static MHWRender::MPxDrawOverride* creator(const MObject& obj) { return new MeshColliderDrawOverride(obj); }
+	MHWRender::DrawAPI supportedDrawAPIs() const { return MHWRender::kOpenGL | MHWRender::kDirectX11 | MHWRender::kOpenGLCoreProfile; }
+	MUserData* prepareForDraw(const MDagPath& objPath, const MDagPath& cameraPath, const MHWRender::MFrameContext& frameContext, MUserData* oldData);
+	virtual bool hasUIDrawables() const { return true; }
+	virtual void addUIDrawables(const MDagPath& objPath, MHWRender::MUIDrawManager& drawManager, const MHWRender::MFrameContext& frameContext, const MUserData* data);
+
+private:
+	MeshColliderDrawOverride(const MObject& obj) : MHWRender::MPxDrawOverride(obj, NULL, true) {} // alwaysDirty = true
+};
