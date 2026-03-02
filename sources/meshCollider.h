@@ -121,10 +121,10 @@ public:
 //  Maya 2026 warns about the old MUserData(bool) constructor.
 //  Using the default MUserData() constructor silences C4996.
 
-class MeshColliderUserData : public MHWRender::MUserData
+class MeshColliderUserData : public MUserData
 {
 public:
-    MeshColliderUserData() : MHWRender::MUserData() {}
+    MeshColliderUserData() : MUserData() {}
     ~MeshColliderUserData() override {}
 
     MeshCollider* meshCollider = nullptr;
