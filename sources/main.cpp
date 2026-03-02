@@ -1,56 +1,103 @@
+// main.cpp — colliders.mll plugin entry point
+// Registers: bellCollider, planeCollider (locators) + meshCollider (deformer)
+
 #include <maya/MFnPlugin.h>
+#include <maya/MGlobal.h>
+#include <maya/MPxDeformerNode.h>
+#include <maya/MPxLocatorNode.h>
+
+// ── Forward declarations from each node's translation unit ──────────────
+// bellCollider & planeCollider — these are locator nodes (they draw a
+// visual gizmo and have no input geometry to deform).
 #include "bellCollider.h"
 #include "planeCollider.h"
+
+// meshCollider — this IS a deformer: it takes input geometry (the cloth
+// mesh) through the inherited "input[].inputGeometry" plug and writes
+// to "outputGeometry".
 #include "meshCollider.h"
 
-MStatus initializePlugin(MObject plugin)
+// ── Node IDs ────────────────────────────────────────────────────────────
+// Use IDs from the Autodesk-assigned block for production plugins,
+// or temporary local IDs (0x00000 – 0x0007ffff) for development.
+static const MTypeId bellColliderId(0x0013BA00);
+static const MTypeId planeColliderId(0x0013BA01);
+static const MTypeId meshColliderId(0x0013BA02);
+
+// ========================================================================
+//  initializePlugin
+// ========================================================================
+MStatus initializePlugin(MObject obj)
 {
-	MStatus stat;
-	MFnPlugin pluginFn(plugin);
+    MStatus status;
+    MFnPlugin fnPlugin(obj, "colliders", "1.0", "Any");
 
-	stat = pluginFn.registerNode("bellCollider", BellCollider::typeId, BellCollider::creator, BellCollider::initialize, MPxNode::kLocatorNode, &BellCollider::drawDbClassification);
-	CHECK_MSTATUS_AND_RETURN_IT(stat);
+    // ── bellCollider  (locator) ─────────────────────────────────────────
+    status = fnPlugin.registerNode(
+        "bellCollider",                 // node type name
+        bellColliderId,                 // MTypeId
+        BellCollider::creator,          // creator function
+        BellCollider::initialize,       // initialize function
+        MPxNode::kLocatorNode           // <-- locator: correct for this node
+    );
+    CHECK_MSTATUS_AND_RETURN_IT(status);
 
-	stat = MHWRender::MDrawRegistry::registerDrawOverrideCreator(BellCollider::drawDbClassification, BellCollider::drawRegistrantId, BellColliderDrawOverride::creator);
-	CHECK_MSTATUS_AND_RETURN_IT(stat);
+    // ── planeCollider (locator) ─────────────────────────────────────────
+    status = fnPlugin.registerNode(
+        "planeCollider",
+        planeColliderId,
+        PlaneCollider::creator,
+        PlaneCollider::initialize,
+        MPxNode::kLocatorNode           // <-- locator: correct for this node
+    );
+    CHECK_MSTATUS_AND_RETURN_IT(status);
 
-	stat = pluginFn.registerNode("planeCollider", PlaneCollider::typeId, PlaneCollider::creator, PlaneCollider::initialize, MPxNode::kLocatorNode, &PlaneCollider::drawDbClassification);
-	CHECK_MSTATUS_AND_RETURN_IT(stat);
+    // ── meshCollider  (DEFORMER) ────────────────────────────────────────
+    //
+    //  *** THIS WAS THE BUG ***
+    //
+    //  BROKEN (was):
+    //      MPxNode::kLocatorNode
+    //
+    //  FIXED (now):
+    //      MPxNode::kDeformerNode
+    //
+    //  Why it matters:
+    //    • cmds.deformer() queries the registry for kDeformerNode types.
+    //    • A kLocatorNode is invisible to that command, so Maya raises:
+    //        RuntimeError: "meshCollider" is not a valid deformer type.
+    //    • The class MUST also inherit MPxDeformerNode (see meshCollider.h).
+    //
+    status = fnPlugin.registerNode(
+        "meshCollider",
+        meshColliderId,
+        MeshCollider::creator,
+        MeshCollider::initialize,
+        MPxNode::kDeformerNode          // <-- FIXED: was kLocatorNode
+    );
+    CHECK_MSTATUS_AND_RETURN_IT(status);
 
-	stat = MHWRender::MDrawRegistry::registerDrawOverrideCreator(PlaneCollider::drawDbClassification, PlaneCollider::drawRegistrantId, PlaneColliderDrawOverride::creator);
-	CHECK_MSTATUS_AND_RETURN_IT(stat);
-
-	stat = pluginFn.registerNode("meshCollider", MeshCollider::typeId, MeshCollider::creator, MeshCollider::initialize, MPxNode::kLocatorNode, &MeshCollider::drawDbClassification);
-	CHECK_MSTATUS_AND_RETURN_IT(stat);
-
-	stat = MHWRender::MDrawRegistry::registerDrawOverrideCreator(MeshCollider::drawDbClassification, MeshCollider::drawRegistrantId, MeshColliderDrawOverride::creator);
-	CHECK_MSTATUS_AND_RETURN_IT(stat);
-
-	return MS::kSuccess;
+    MGlobal::displayInfo("colliders.mll loaded  (bell | plane | meshCollider)");
+    return MS::kSuccess;
 }
 
-MStatus uninitializePlugin(MObject plugin)
+// ========================================================================
+//  uninitializePlugin
+// ========================================================================
+MStatus uninitializePlugin(MObject obj)
 {
-	MStatus stat;
-	MFnPlugin pluginFn(plugin);
+    MStatus status;
+    MFnPlugin fnPlugin(obj);
 
-	stat = MHWRender::MDrawRegistry::deregisterDrawOverrideCreator(BellCollider::drawDbClassification, BellCollider::drawRegistrantId);
-	CHECK_MSTATUS_AND_RETURN_IT(stat);
+    status = fnPlugin.deregisterNode(bellColliderId);
+    CHECK_MSTATUS_AND_RETURN_IT(status);
 
-	stat = pluginFn.deregisterNode(BellCollider::typeId);
-	CHECK_MSTATUS_AND_RETURN_IT(stat);
+    status = fnPlugin.deregisterNode(planeColliderId);
+    CHECK_MSTATUS_AND_RETURN_IT(status);
 
-	stat = MHWRender::MDrawRegistry::deregisterDrawOverrideCreator(PlaneCollider::drawDbClassification, PlaneCollider::drawRegistrantId);
-	CHECK_MSTATUS_AND_RETURN_IT(stat);
+    status = fnPlugin.deregisterNode(meshColliderId);
+    CHECK_MSTATUS_AND_RETURN_IT(status);
 
-	stat = pluginFn.deregisterNode(PlaneCollider::typeId);
-	CHECK_MSTATUS_AND_RETURN_IT(stat);
-
-	stat = MHWRender::MDrawRegistry::deregisterDrawOverrideCreator(MeshCollider::drawDbClassification, MeshCollider::drawRegistrantId);
-	CHECK_MSTATUS_AND_RETURN_IT(stat);
-
-	stat = pluginFn.deregisterNode(MeshCollider::typeId);
-	CHECK_MSTATUS_AND_RETURN_IT(stat);
-
-	return MS::kSuccess;
+    MGlobal::displayInfo("colliders.mll unloaded");
+    return MS::kSuccess;
 }
