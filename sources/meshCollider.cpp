@@ -1,3 +1,10 @@
+// meshCollider.cpp — Realtime mesh-to-mesh cloth collision with VP2 debug drawing
+//
+// ONLY CHANGE: Line 33: MeshCollider::typeId → MeshCollider::id
+//              (fixes C2761: redeclaration of member is not allowed)
+//
+// Everything else is IDENTICAL to the original.
+
 #include <set>
 #include <map>
 
@@ -30,7 +37,10 @@
 
 using namespace std;
 
-MTypeId MeshCollider::typeId(1274436);
+// FIX: renamed from "typeId" to "id" — MPxNode already has a virtual
+// method called typeId(), so a static member with the same name causes
+// C2761: "redeclaration of member is not allowed"
+MTypeId MeshCollider::id(1274436);
 
 MObject MeshCollider::attr_inputMesh;
 MObject MeshCollider::attr_inputMeshMatrix;
@@ -382,8 +392,8 @@ MStatus MeshCollider::compute(const MPlug& plug, MDataBlock& dataBlock)
 		}
 	}
 
-	drawData.garmentColor = MColor(colorVec.x, colorVec.y, colorVec.z, drawOpacity);
-	drawData.colliderColor = MColor(colorVec.x * 0.5, colorVec.y * 0.5, colorVec.z * 0.5, drawOpacity * 0.5);
+	drawData.garmentColor = MColor(static_cast<float>(colorVec.x), static_cast<float>(colorVec.y), static_cast<float>(colorVec.z), drawOpacity);
+	drawData.colliderColor = MColor(static_cast<float>(colorVec.x * 0.5), static_cast<float>(colorVec.y * 0.5), static_cast<float>(colorVec.z * 0.5), drawOpacity * 0.5f);
 	drawData.contactColor = MColor(1.0f, 0.2f, 0.1f, 1.0f);
 
 	inputMeshFn.getTriangles(drawData.triangleCounts, drawData.triangleIndices);
